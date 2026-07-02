@@ -61,9 +61,6 @@ static SpiBuffer_t* rx_buffer;
 static xQueueHandle tx_queue;
 static xQueueHandle rx_queue;
 
-#define TASK_EVENT (1<<0)
-static EventGroupHandle_t task_event;
-
 static const int START_UP_MAIN_TASK = BIT0;
 static EventGroupHandle_t startUpEventGroup;
 
@@ -71,9 +68,18 @@ static TaskHandle_t spi_task_handle;
 
 
 void IRAM_ATTR gap_rtt_enabled_handler(void * _param) {
-    int task_woken = 0;
+    // Wake spi_task with a direct task notification. The previous
+    // xEventGroupSetBitsFromISR() defers through the timer-daemon command
+    // queue and silently fails when that queue is full (which happens under
+    // sustained streaming load) - a lost edge parked spi_task in a forever
+    // wait while the GAP8 held its RTT line high, wedging the entire
+    // GAP8<->WiFi route. vTaskNotifyGiveFromISR() runs in the ISR itself and
+    // cannot be lost.
+    BaseType_t task_woken = pdFALSE;
 
-    xEventGroupSetBitsFromISR(task_event, TASK_EVENT, &task_woken);
+    if (spi_task_handle != NULL) {
+        vTaskNotifyGiveFromISR(spi_task_handle, &task_woken);
+    }
 
     portYIELD_FROM_ISR(task_woken);
 }
@@ -92,9 +98,15 @@ static void spi_task(void* _param) {
 
     xEventGroupSetBits(startUpEventGroup, START_UP_MAIN_TASK);
     while(1) {
-        if (uxQueueMessagesWaiting(tx_queue) == 0) {
+        // Sleep only while there is truly nothing to do: no queued TX and the
+        // GAP8 is not holding its RTT line high. Re-checking the GPIO *level*
+        // on a short timeout self-heals a lost wake-up instead of parking
+        // forever on a notification that never comes (the GAP8 raises RTT
+        // before its transfer wait and only lowers it mid-transfer, so a high
+        // level here always means it is waiting for us to arm a transaction).
+        while (uxQueueMessagesWaiting(tx_queue) == 0 && gpio_get_level(GAP_RTT_GPIO) == 0) {
             DEBUG("Waiting for events ...");
-            xEventGroupWaitBits(task_event, TASK_EVENT, pdTRUE, pdTRUE, portMAX_DELAY);
+            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(10));
         }
 
         // Check if we can send a packet
@@ -146,8 +158,6 @@ void spi_transport_init() {
     // Setting up synchronization items
     tx_queue = xQueueCreate(TX_QUEUE_LENGTH, sizeof(CPXRoutablePacket_t));
     rx_queue = xQueueCreate(RX_QUEUE_LENGTH, sizeof(CPXRoutablePacket_t));
-
-    task_event = xEventGroupCreate();
 
     // Setting up GPIOs
     gpio_config_t gap_rtt_conf = {
@@ -213,7 +223,7 @@ void spi_transport_init() {
 void spi_transport_send(const CPXRoutablePacket_t* packet) {
     assert(packet->dataLength <= SPI_TRANSPORT_MTU - CPX_ROUTING_PACKED_SIZE);
     xQueueSend(tx_queue, packet, portMAX_DELAY);
-    xEventGroupSetBits(task_event, TASK_EVENT);
+    xTaskNotifyGive(spi_task_handle);
 }
 
 void spi_transport_receive(CPXRoutablePacket_t* packet) {

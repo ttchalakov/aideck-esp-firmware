@@ -70,10 +70,22 @@ static EventGroupHandle_t startUpEventGroup;
 
 
 #define NO_CONNECTION -1
-#define WIFI_HOST_QUEUE_LENGTH (2)
+// 2 was too tight (any TCP jitter immediately backpressured the SPI/GAP8
+// route), but every slot is ~1 KB of a ~40 KB heap - and heap headroom is
+// what keeps the WiFi driver alive under load (see wifi_status_task).
+#define WIFI_HOST_QUEUE_LENGTH (4)
+
+// How many consecutive 1 s send timeouts before the client is declared dead
+// and the socket is closed. This bounds a send stall to a few seconds instead
+// of blocking the TX task (and, through the queues, the SPI/GAP8 route)
+// forever.
+#define WIFI_SEND_TIMEOUT_MAX (5)
 
 static xQueueHandle wifiRxQueue;
 static xQueueHandle wifiTxQueue;
+
+/* Serializes client-socket close between the RX and TX tasks */
+static SemaphoreHandle_t socketCloseLock;
 
 /* Log printout tag */
 static const char *TAG = "WIFI";
@@ -175,6 +187,10 @@ static void wifi_init_softap(const char *ssid, const char* key)
   wifi_config_t wifi_config = {
       .ap = {
           .ssid_len = strlen(ssid),
+          // Default was channel 1, the most congested band in this lab; RF
+          // retry pressure deepens the driver TX queues and helps trip the
+          // low-heap radio failure under streaming load.
+          .channel = 6,
           .max_connection = 1,
           .authmode = WIFI_AUTH_OPEN},
   };
@@ -257,9 +273,19 @@ static void wifi_ctrl(void* _param) {
 
 static void close_client_socket()
 {
-    close(clientConnection);
+    // Both the RX and TX tasks call this on error; take the fd atomically so
+    // the socket is only closed once, and shutdown() first so a task still
+    // blocked in recv()/send() on it returns instead of holding a dead fd.
+    xSemaphoreTake(socketCloseLock, portMAX_DELAY);
+    int connection = clientConnection;
     clientConnection = NO_CONNECTION;
-    xEventGroupSetBits(s_wifi_event_group, WIFI_SOCKET_DISCONNECTED);
+    xSemaphoreGive(socketCloseLock);
+
+    if (connection != NO_CONNECTION) {
+        shutdown(connection, SHUT_RDWR);
+        close(connection);
+        xEventGroupSetBits(s_wifi_event_group, WIFI_SOCKET_DISCONNECTED);
+    }
 }
 
 void wifi_bind_socket() {
@@ -300,7 +326,22 @@ void wifi_wait_for_socket_connected() {
   if (clientConnection < 0) {
     ESP_LOGE(TAG, "Unable to accept connection: errno %d", errno);
   } else {
-     ESP_LOGI(TAG, "Connection accepted");
+    // Bound every send and detect a vanished peer. An unbounded blocking
+    // send() on this socket is what stalled the whole GAP8->WiFi route (see
+    // wifi_send_packet); keepalive catches a host that disappears without a
+    // FIN, and NODELAY stops Nagle from delaying the length-prefixed stream.
+    const struct timeval sendTimeout = { .tv_sec = 1, .tv_usec = 0 };
+    setsockopt(clientConnection, SOL_SOCKET, SO_SNDTIMEO, &sendTimeout, sizeof(sendTimeout));
+    const int enable = 1;
+    setsockopt(clientConnection, IPPROTO_TCP, TCP_NODELAY, &enable, sizeof(enable));
+    setsockopt(clientConnection, SOL_SOCKET, SO_KEEPALIVE, &enable, sizeof(enable));
+    const int keepIdleS = 5;
+    const int keepIntvlS = 2;
+    const int keepCntS = 3;
+    setsockopt(clientConnection, IPPROTO_TCP, TCP_KEEPIDLE, &keepIdleS, sizeof(keepIdleS));
+    setsockopt(clientConnection, IPPROTO_TCP, TCP_KEEPINTVL, &keepIntvlS, sizeof(keepIntvlS));
+    setsockopt(clientConnection, IPPROTO_TCP, TCP_KEEPCNT, &keepCntS, sizeof(keepCntS));
+    ESP_LOGI(TAG, "Connection accepted");
   }
 }
 
@@ -360,6 +401,19 @@ static void wifi_task(void *pvParameters) {
   }
 }
 
+static void wifi_status_task(void *pvParameters)
+{
+  // Heap telemetry over the (radio-visible) console: the WiFi blob's radio TX
+  // can die under sustained load while the app runs on - this shows whether
+  // memory exhaustion precedes the death.
+  while (1) {
+    vTaskDelay(pdMS_TO_TICKS(5000));
+    ESP_LOGI(TAG, "status: heap %u (min %u), client %s",
+             esp_get_free_heap_size(), esp_get_minimum_free_heap_size(),
+             clientConnection == NO_CONNECTION ? "no" : "yes");
+  }
+}
+
 void wifi_led_task(void *pvParameters)
 {
   int ledstate = 0;
@@ -383,17 +437,39 @@ void wifi_led_task(void *pvParameters)
 }
 
 void wifi_send_packet(const char * buffer, size_t size) {
-  if (clientConnection != NO_CONNECTION) {
-    ESP_LOGD(TAG, "Sending WiFi packet of size %u", size);
-    xEventGroupSetBits(s_wifi_event_group, WIFI_PACKET_SENDING);
-    int err = send(clientConnection, buffer, size, 0);
-    if (err < 0) {
+  if (clientConnection == NO_CONNECTION) {
+    return;
+  }
+  ESP_LOGD(TAG, "Sending WiFi packet of size %u", size);
+  xEventGroupSetBits(s_wifi_event_group, WIFI_PACKET_SENDING);
+
+  // send() may write only part of the buffer (SO_SNDTIMEO is set); the old
+  // code ignored the byte count, silently truncating packets and desyncing
+  // the host's length-prefixed stream. Loop until fully written, and give up
+  // on a peer that stops draining for WIFI_SEND_TIMEOUT_MAX seconds.
+  size_t written = 0;
+  int timeouts = 0;
+  while (written < size && clientConnection != NO_CONNECTION) {
+    int sent = send(clientConnection, buffer + written, size - written, 0);
+    if (sent > 0) {
+      written += sent;
+      timeouts = 0;
+    } else if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+      timeouts++;
+      if (timeouts == 1) {
+        ESP_LOGW(TAG, "Send timeout (errno %d), heap %u (min %u)", errno,
+                 esp_get_free_heap_size(), esp_get_minimum_free_heap_size());
+      }
+      if (timeouts >= WIFI_SEND_TIMEOUT_MAX) {
+        ESP_LOGE(TAG, "Send stalled for %d s, closing connection", WIFI_SEND_TIMEOUT_MAX);
+        close_client_socket();
+      }
+    } else {
       ESP_LOGE(TAG, "Error occurred during sending: errno %d", errno);
       close_client_socket();
-
     }
-    xEventGroupSetBits(s_wifi_event_group, WIFI_PACKET_WAIT_SEND);
   }
+  xEventGroupSetBits(s_wifi_event_group, WIFI_PACKET_WAIT_SEND);
 }
 
 static void wifi_sending_task(void *pvParameters) {
@@ -416,26 +492,59 @@ static void wifi_sending_task(void *pvParameters) {
 
 static void wifi_receiving_task(void *pvParameters) {
   static WifiTransportPacket_t rxp_wifi;
-  int len;
+  int len = 0;
 
   xEventGroupSetBits(startUpEventGroup, START_UP_RX_TASK);
   while (1) {
-    len = recv(clientConnection, &rxp_wifi, 2, 0);
-    if (len > 0) {
-      ESP_LOGD(TAG, "Wire data length %i", rxp_wifi.payloadLength);
-      int totalRxLen = 0;
-      do {
-        len = recv(clientConnection, &rxp_wifi.payload[totalRxLen], rxp_wifi.payloadLength - totalRxLen, 0);
-        ESP_LOGD(TAG, "Read %i bytes", len);
-        totalRxLen += len;
-      } while (totalRxLen < rxp_wifi.payloadLength);
-      ESP_LOG_BUFFER_HEX_LEVEL(TAG, &rxp_wifi, 10, ESP_LOG_DEBUG);
-      xQueueSend(wifiRxQueue, &rxp_wifi, portMAX_DELAY);
-    } else if (len == 0) {
-      close_client_socket();  //Reading 0 bytes most often means the client has disconnected.
-    } else {
+    if (clientConnection == NO_CONNECTION) {
       vTaskDelay(10);
+      continue;
     }
+
+    // Read the exact 2-byte length header; a short read here (or an error in
+    // the payload loop below, which the old code never checked) permanently
+    // desynced the host->deck stream.
+    int headerLen = 0;
+    while (headerLen < 2) {
+      len = recv(clientConnection, ((uint8_t*)&rxp_wifi) + headerLen, 2 - headerLen, 0);
+      if (len <= 0) {
+        break;
+      }
+      headerLen += len;
+    }
+    if (headerLen < 2) {
+      if (len == 0) {
+        close_client_socket();  //Reading 0 bytes most often means the client has disconnected.
+      } else {
+        vTaskDelay(10);
+      }
+      continue;
+    }
+
+    if (rxp_wifi.payloadLength > WIFI_TRANSPORT_MTU) {
+      ESP_LOGE(TAG, "Bad wire length %i, closing connection", rxp_wifi.payloadLength);
+      close_client_socket();
+      continue;
+    }
+
+    ESP_LOGD(TAG, "Wire data length %i", rxp_wifi.payloadLength);
+    int totalRxLen = 0;
+    while (totalRxLen < rxp_wifi.payloadLength) {
+      len = recv(clientConnection, &rxp_wifi.payload[totalRxLen], rxp_wifi.payloadLength - totalRxLen, 0);
+      if (len <= 0) {
+        break;
+      }
+      ESP_LOGD(TAG, "Read %i bytes", len);
+      totalRxLen += len;
+    }
+    if (totalRxLen < rxp_wifi.payloadLength) {
+      // Mid-packet EOF or error: the stream cannot be re-synced, drop the client.
+      close_client_socket();
+      continue;
+    }
+
+    ESP_LOG_BUFFER_HEX_LEVEL(TAG, &rxp_wifi, 10, ESP_LOG_DEBUG);
+    xQueueSend(wifiRxQueue, &rxp_wifi, portMAX_DELAY);
   }
 }
 
@@ -464,12 +573,15 @@ void wifi_init() {
   wifiRxQueue = xQueueCreate(WIFI_HOST_QUEUE_LENGTH, sizeof(WifiTransportPacket_t));
   wifiTxQueue = xQueueCreate(WIFI_HOST_QUEUE_LENGTH, sizeof(CPXRoutablePacket_t));
 
+  socketCloseLock = xSemaphoreCreateMutex();
+
   startUpEventGroup = xEventGroupCreate();
   xEventGroupClearBits(startUpEventGroup, START_UP_MAIN_TASK | START_UP_RX_TASK | START_UP_TX_TASK | START_UP_CTRL_TASK);
   xTaskCreate(wifi_task, "WiFi TASK", 5000, NULL, 1, NULL);
   xTaskCreate(wifi_sending_task, "WiFi TX", 5000, NULL, 1, NULL);
   xTaskCreate(wifi_receiving_task, "WiFi RX", 5000, NULL, 1, NULL);
   xTaskCreate(wifi_led_task, "WiFi LED", 5000, NULL, 1, NULL);
+  xTaskCreate(wifi_status_task, "WiFi STATUS", 3000, NULL, 1, NULL);
   ESP_LOGI(TAG, "Waiting for main, RX and TX tasks to start");
   xEventGroupWaitBits(startUpEventGroup,
                       START_UP_MAIN_TASK | START_UP_RX_TASK | START_UP_TX_TASK,
