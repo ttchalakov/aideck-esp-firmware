@@ -43,6 +43,7 @@
 #include "lwip/sockets.h"
 #include <lwip/netdb.h>
 #include "esp_netif.h"
+#include "esp_mac.h"
 
 #include "com.h"
 #define BLINK_GPIO 4
@@ -81,8 +82,8 @@ static EventGroupHandle_t startUpEventGroup;
 // forever.
 #define WIFI_SEND_TIMEOUT_MAX (5)
 
-static xQueueHandle wifiRxQueue;
-static xQueueHandle wifiTxQueue;
+static QueueHandle_t wifiRxQueue;
+static QueueHandle_t wifiTxQueue;
 
 /* Serializes client-socket close between the RX and TX tasks */
 static SemaphoreHandle_t socketCloseLock;
@@ -202,7 +203,7 @@ static void wifi_init_softap(const char *ssid, const char* key)
 
   ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
   ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
-  ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_AP, &wifi_config));
+  ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
   ESP_ERROR_CHECK(esp_wifi_start());
 
   ESP_LOGI(TAG, "wifi_init_softap finished");
@@ -222,7 +223,7 @@ static void wifi_init_sta(const char * ssid, const char * key)
 
   ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA) );
   ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
-  ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config) );
+  ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config) );
   ESP_ERROR_CHECK(esp_wifi_start() );
 
   ESP_LOGI(TAG, "wifi_init_sta finished.");
@@ -321,7 +322,7 @@ void wifi_bind_socket() {
 void wifi_wait_for_socket_connected() {
   ESP_LOGI(TAG, "Waiting for connection");
   struct sockaddr sourceAddr;
-  uint addrLen = sizeof(sourceAddr);
+  socklen_t addrLen = sizeof(sourceAddr);
   clientConnection = accept(serverSock, (struct sockaddr *)&sourceAddr, &addrLen);
   if (clientConnection < 0) {
     ESP_LOGE(TAG, "Unable to accept connection: errno %d", errno);
@@ -360,9 +361,9 @@ static void wifi_task(void *pvParameters) {
   ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
   uint8_t mac[6];
-  ESP_ERROR_CHECK(esp_wifi_get_mac(ESP_IF_WIFI_AP, mac));
+  ESP_ERROR_CHECK(esp_wifi_get_mac(WIFI_IF_AP, mac));
   ESP_LOGD(TAG, "AP MAC is %x:%x:%x:%x:%x:%x", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-  ESP_ERROR_CHECK(esp_wifi_get_mac(ESP_IF_WIFI_STA, mac));
+  ESP_ERROR_CHECK(esp_wifi_get_mac(WIFI_IF_STA, mac));
   ESP_LOGD(TAG, "STA MAC is %x:%x:%x:%x:%x:%x", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
   wifi_bind_socket();
@@ -409,7 +410,7 @@ static void wifi_status_task(void *pvParameters)
   while (1) {
     vTaskDelay(pdMS_TO_TICKS(5000));
     ESP_LOGI(TAG, "status: heap %u (min %u), client %s",
-             esp_get_free_heap_size(), esp_get_minimum_free_heap_size(),
+             (unsigned)esp_get_free_heap_size(), (unsigned)esp_get_minimum_free_heap_size(),
              clientConnection == NO_CONNECTION ? "no" : "yes");
   }
 }
@@ -458,7 +459,7 @@ void wifi_send_packet(const char * buffer, size_t size) {
       timeouts++;
       if (timeouts == 1) {
         ESP_LOGW(TAG, "Send timeout (errno %d), heap %u (min %u)", errno,
-                 esp_get_free_heap_size(), esp_get_minimum_free_heap_size());
+                 (unsigned)esp_get_free_heap_size(), (unsigned)esp_get_minimum_free_heap_size());
       }
       if (timeouts >= WIFI_SEND_TIMEOUT_MAX) {
         ESP_LOGE(TAG, "Send stalled for %d s, closing connection", WIFI_SEND_TIMEOUT_MAX);

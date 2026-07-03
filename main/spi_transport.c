@@ -58,8 +58,8 @@
 static SpiBuffer_t* tx_buffer;
 static SpiBuffer_t* rx_buffer;
 
-static xQueueHandle tx_queue;
-static xQueueHandle rx_queue;
+static QueueHandle_t tx_queue;
+static QueueHandle_t rx_queue;
 
 static const int START_UP_MAIN_TASK = BIT0;
 static EventGroupHandle_t startUpEventGroup;
@@ -135,7 +135,7 @@ static void spi_task(void* _param) {
         };
 
         DEBUG("Transaction set up");
-        spi_slave_transmit(VSPI_HOST, &transaction, portMAX_DELAY);
+        spi_slave_transmit(SPI3_HOST, &transaction, portMAX_DELAY);
 
         DEBUG("Transaction done: %dB", transaction.trans_len/8);
 
@@ -198,7 +198,7 @@ void spi_transport_init() {
         .post_trans_cb = spi_post_transfer,
     };
 
-    spi_slave_initialize(VSPI_HOST, &spi_config, &spi_slave_config, 1);
+    spi_slave_initialize(SPI3_HOST, &spi_config, &spi_slave_config, 1);
 
     // Allocating buffers
     // TODO krri Malloc?

@@ -45,9 +45,9 @@
 #define ESP_TEST_QUEUE_LENGTH (2)
 #define ESP_TEST_QUEUE_SIZE (sizeof(esp_routable_packet_t))
 
-static xQueueHandle espWiFiCTRLQueue;
-static xQueueHandle espSystemQueue;
-static xQueueHandle espTESTQueue;
+static QueueHandle_t espWiFiCTRLQueue;
+static QueueHandle_t espSystemQueue;
+static QueueHandle_t espTESTQueue;
 
 static esp_routable_packet_t rxp;
 

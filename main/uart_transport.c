@@ -71,8 +71,8 @@ typedef struct {
 //#define DEBUG(...)
 
 
-static xQueueHandle tx_queue;
-static xQueueHandle rx_queue;
+static QueueHandle_t tx_queue;
+static QueueHandle_t rx_queue;
 
 static CPXRoutablePacket_t qPacket;
 static uart_transport_packet_t txp;

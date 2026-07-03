@@ -38,8 +38,8 @@
 #define ESP_ROUTER_TX_QUEUE_LENGTH (4)
 #define ESP_ROUTER_RX_QUEUE_LENGTH (4)
 
-static xQueueHandle espRxQueue;
-static xQueueHandle espTxQueue;
+static QueueHandle_t espRxQueue;
+static QueueHandle_t espTxQueue;
 
 
 void espTransportInit() {

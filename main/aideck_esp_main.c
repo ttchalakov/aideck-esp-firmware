@@ -27,8 +27,9 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_system.h"
-#include "esp_spi_flash.h"
+
 #include "driver/gpio.h"
+#include "esp_rom_gpio.h"
 #include "driver/uart.h"
 #include "nvs_flash.h"
 #include "esp_log.h"
@@ -142,7 +143,7 @@ void app_main(void)
     ESP_ERROR_CHECK(nvs_flash_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_log_level_set("DISCOVERY", ESP_LOG_INFO);
-    gpio_pad_select_gpio(BLINK_GPIO);
+    esp_rom_gpio_pad_select_gpio(BLINK_GPIO);
     gpio_set_direction(BLINK_GPIO, GPIO_MODE_OUTPUT);
     gpio_set_level(BLINK_GPIO, 1);
 
@@ -165,7 +166,7 @@ void app_main(void)
     uart_set_pin(UART_NUM_1, 0, 25, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
 
     ESP_LOGI("SYS", "\n\n -- Starting up --\n");
-    ESP_LOGI("SYS", "Minimum free heap size: %d bytes", esp_get_minimum_free_heap_size());
+    ESP_LOGI("SYS", "Minimum free heap size: %u bytes", (unsigned)esp_get_minimum_free_heap_size());
 
     espTransportInit();
     uart_transport_init();

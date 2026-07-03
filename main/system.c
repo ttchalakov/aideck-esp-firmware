@@ -27,6 +27,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
+#include "esp_rom_gpio.h"
 #include "esp_system.h"
 #include "esp_log.h"
 
@@ -38,7 +39,7 @@
 #define GAP8_RST_GPIO 27
 
 static void resetGAP8() {
-  gpio_pad_select_gpio(GAP8_RST_GPIO);
+  esp_rom_gpio_pad_select_gpio(GAP8_RST_GPIO);
   gpio_set_direction(GAP8_RST_GPIO, GPIO_MODE_OUTPUT);
   gpio_set_level(GAP8_RST_GPIO, 0);
   vTaskDelay(10);
