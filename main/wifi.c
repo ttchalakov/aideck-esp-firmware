@@ -46,6 +46,7 @@
 #include "esp_mac.h"
 
 #include "com.h"
+#include "spi_transport.h"
 #define BLINK_GPIO 4
 
 static esp_routable_packet_t rxp;
@@ -84,6 +85,10 @@ static EventGroupHandle_t startUpEventGroup;
 
 static QueueHandle_t wifiRxQueue;
 static QueueHandle_t wifiTxQueue;
+static volatile uint32_t wifiTxEnqueued;
+static volatile uint32_t wifiTxDequeued;
+static volatile uint32_t wifiSendCalls;
+static volatile uint32_t wifiBytesWritten;
 
 /* Serializes client-socket close between the RX and TX tasks */
 static SemaphoreHandle_t socketCloseLock;
@@ -409,9 +414,18 @@ static void wifi_status_task(void *pvParameters)
   // memory exhaustion precedes the death.
   while (1) {
     vTaskDelay(pdMS_TO_TICKS(5000));
-    ESP_LOGI(TAG, "status: heap %u (min %u), client %s",
+    uint32_t spiTransactions = 0, spiTxPackets = 0, spiRxPackets = 0;
+    int gapRtt = 0, spiArmed = 0;
+    spi_transport_debug(&spiTransactions, &spiTxPackets, &spiRxPackets, &gapRtt, &spiArmed);
+    ESP_LOGI(TAG, "status: heap %u (min %u), client %s, txq %u enq %u deq %u send %u bytes %u",
              (unsigned)esp_get_free_heap_size(), (unsigned)esp_get_minimum_free_heap_size(),
-             clientConnection == NO_CONNECTION ? "no" : "yes");
+             clientConnection == NO_CONNECTION ? "no" : "yes",
+             (unsigned)uxQueueMessagesWaiting(wifiTxQueue),
+             (unsigned)wifiTxEnqueued, (unsigned)wifiTxDequeued,
+             (unsigned)wifiSendCalls, (unsigned)wifiBytesWritten);
+    ESP_LOGI(TAG, "spi: txn %u txp %u rxp %u gap_rtt %d armed %d",
+             (unsigned)spiTransactions, (unsigned)spiTxPackets,
+             (unsigned)spiRxPackets, gapRtt, spiArmed);
   }
 }
 
@@ -442,6 +456,7 @@ void wifi_send_packet(const char * buffer, size_t size) {
     return;
   }
   ESP_LOGD(TAG, "Sending WiFi packet of size %u", size);
+  wifiSendCalls++;
   xEventGroupSetBits(s_wifi_event_group, WIFI_PACKET_SENDING);
 
   // send() may write only part of the buffer (SO_SNDTIMEO is set); the old
@@ -454,6 +469,7 @@ void wifi_send_packet(const char * buffer, size_t size) {
     int sent = send(clientConnection, buffer + written, size - written, 0);
     if (sent > 0) {
       written += sent;
+      wifiBytesWritten += sent;
       timeouts = 0;
     } else if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
       timeouts++;
@@ -480,6 +496,7 @@ static void wifi_sending_task(void *pvParameters) {
   xEventGroupSetBits(startUpEventGroup, START_UP_TX_TASK);
   while (1) {
     xQueueReceive(wifiTxQueue, &qPacket, portMAX_DELAY);
+    wifiTxDequeued++;
 
     txp_wifi.payloadLength = qPacket.dataLength + CPX_ROUTING_PACKED_SIZE;
 
@@ -552,6 +569,7 @@ static void wifi_receiving_task(void *pvParameters) {
 void wifi_transport_send(const CPXRoutablePacket_t* packet) {
   assert(packet->dataLength <= WIFI_TRANSPORT_MTU - CPX_ROUTING_PACKED_SIZE);
   xQueueSend(wifiTxQueue, packet, portMAX_DELAY);
+  wifiTxEnqueued++;
 }
 
 void wifi_transport_receive(CPXRoutablePacket_t* packet) {

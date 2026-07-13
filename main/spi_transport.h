@@ -52,3 +52,9 @@ void spi_transport_init();
 // Interface used by the router
 void spi_transport_send(const CPXRoutablePacket_t* packet);
 void spi_transport_receive(CPXRoutablePacket_t* packet);
+
+// Handshake debug counters for the status log: completed slave transactions,
+// tx/rx CPX packets, live GAP8 RTT pin level, and whether a transaction is
+// currently armed (ESP RTT high).
+void spi_transport_debug(uint32_t *transactions, uint32_t *txPackets,
+                         uint32_t *rxPackets, int *gapRttLevel, int *armed);

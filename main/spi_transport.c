@@ -66,6 +66,23 @@ static EventGroupHandle_t startUpEventGroup;
 
 static TaskHandle_t spi_task_handle;
 
+// Debug view of the GAP8<->ESP handshake: completed slave transactions, CPX
+// packets moved in each direction, whether a transaction is currently armed
+// (ESP RTT high), and the live level of the GAP8 RTT line. Together these
+// tell from the ESP side which end of the link stopped talking.
+static volatile uint32_t spiTransactionCount;
+static volatile uint32_t spiTxPacketCount;
+static volatile uint32_t spiRxPacketCount;
+static volatile int spiArmed;
+
+void spi_transport_debug(uint32_t *transactions, uint32_t *txPackets,
+                         uint32_t *rxPackets, int *gapRttLevel, int *armed) {
+    if (transactions) *transactions = spiTransactionCount;
+    if (txPackets) *txPackets = spiTxPacketCount;
+    if (rxPackets) *rxPackets = spiRxPacketCount;
+    if (gapRttLevel) *gapRttLevel = gpio_get_level(GAP_RTT_GPIO);
+    if (armed) *armed = spiArmed;
+}
 
 void IRAM_ATTR gap_rtt_enabled_handler(void * _param) {
     // Wake spi_task with a direct task notification. The previous
@@ -86,10 +103,12 @@ void IRAM_ATTR gap_rtt_enabled_handler(void * _param) {
 
 volatile int plop;
 static IRAM_ATTR void spi_post_setup(struct spi_slave_transaction_t * _transaction) {
+    spiArmed = 1;
     gpio_set_level(ESP_RTT_GPIO, 1);
 }
 
 static IRAM_ATTR void spi_post_transfer(struct spi_slave_transaction_t * _transaction) {
+    spiArmed = 0;
     gpio_set_level(ESP_RTT_GPIO, 0);
 }
 
@@ -139,10 +158,16 @@ static void spi_task(void* _param) {
 
         DEBUG("Transaction done: %dB", transaction.trans_len/8);
 
+        spiTransactionCount++;
+        if (tx_buffer->structuredData.dataLength != 0) {
+            spiTxPacketCount++;
+        }
+
         int rx_len  = rx_buffer->structuredData.dataLength;
 
         // If there is some data received, push the packet in the RX queue!
         if (rx_len != 0) {
+            spiRxPacketCount++;
             qPacket.dataLength = rx_len - CPX_ROUTING_PACKED_SIZE;
 
             cpxPackedToRoute(&rx_buffer->structuredData.route, &qPacket.route);
