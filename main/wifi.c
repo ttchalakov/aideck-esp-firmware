@@ -25,6 +25,7 @@
 #include "wifi.h"
 
 #include <stdio.h>
+#include <stdbool.h>
 #include <string.h>
 
 #include "freertos/FreeRTOS.h"
@@ -106,10 +107,45 @@ enum {
   WIFI_CTRL_SET_KEY                 = 0x11,
 
   WIFI_CTRL_WIFI_CONNECT            = 0x20,
+  WIFI_CTRL_SET_TRANSPORT           = 0x21,
 
   WIFI_CTRL_STATUS_WIFI_CONNECTED   = 0x31,
   WIFI_CTRL_STATUS_CLIENT_CONNECTED = 0x32,
 };
+
+// Host link transport, chosen at runtime by the GAP8 (WIFI_CTRL_SET_TRANSPORT)
+// before it asks to connect. TCP is framed and lossless (integrity transport);
+// UDP is connectionless and drop-tolerant (a stalled host cannot back-pressure
+// the SPI/GAP8 route, at the cost of dropped datagrams). Default TCP so any app
+// that never sends SET_TRANSPORT behaves exactly as before.
+enum {
+  WIFI_TRANSPORT_TCP = 0,
+  WIFI_TRANSPORT_UDP = 1,
+};
+static volatile uint8_t transportMode = WIFI_TRANSPORT_TCP;
+
+// UDP host address, learned from the source of the "FER" magic datagram. Guarded
+// by udpTargetLock because the RX task writes it and the TX task reads it.
+static struct sockaddr_in udpDestAddr;
+static volatile bool udpClientKnown = false;
+static SemaphoreHandle_t udpTargetLock;
+
+// Released by the WIFI_CTRL_WIFI_CONNECT handler once the transport is final and
+// WiFi is up, so wifi_task binds the right kind of socket.
+static SemaphoreHandle_t serveReadySem;
+
+// Tell the GAP8 (and STM32) whether a host is connected. Used from the UDP RX
+// task on the first FER datagram; the TCP path signals the same from wifi_task.
+static void wifi_signal_client_connected(uint8_t connected) {
+  static esp_routable_packet_t p;
+  cpxInitRoute(CPX_T_ESP32, CPX_T_GAP8, CPX_F_WIFI_CTRL, &p.route);
+  p.data[0] = WIFI_CTRL_STATUS_CLIENT_CONNECTED;
+  p.data[1] = connected;
+  p.dataLength = 2;
+  espAppSendToRouterBlocking(&p);
+  p.route.destination = CPX_T_STM32;
+  espAppSendToRouterBlocking(&p);
+}
 
 /* WiFi event handler */
 static void event_handler(void* handlerArg, esp_event_base_t eventBase, int32_t eventId, void* eventData)
@@ -255,6 +291,12 @@ static void wifi_ctrl(void* _param) {
         ESP_LOGD(TAG, "KEY: %s", key);
         // Save to NVS?
         break;
+      case WIFI_CTRL_SET_TRANSPORT:
+        transportMode = (rxp.data[1] == WIFI_TRANSPORT_UDP) ? WIFI_TRANSPORT_UDP
+                                                            : WIFI_TRANSPORT_TCP;
+        ESP_LOGI(TAG, "Transport set to %s",
+                 transportMode == WIFI_TRANSPORT_UDP ? "UDP" : "TCP");
+        break;
       case WIFI_CTRL_WIFI_CONNECT:
         ESP_LOGD("WIFI", "Should connect");
 
@@ -268,6 +310,9 @@ static void wifi_ctrl(void* _param) {
               wifi_init_softap(ssid, key);
             }
           }
+          // Transport is now final and WiFi is coming up: let wifi_task bind the
+          // matching (TCP stream vs UDP datagram) server socket and start serving.
+          xSemaphoreGive(serveReadySem);
         } else {
           ESP_LOGW(TAG, "No SSID set, cannot start wifi");
         }
@@ -295,33 +340,35 @@ static void close_client_socket()
 }
 
 void wifi_bind_socket() {
-  char addr_str[128];
-  int addr_family;
-  int ip_protocol;
+  const bool udp = (transportMode == WIFI_TRANSPORT_UDP);
   struct sockaddr_in destAddr;
   destAddr.sin_addr.s_addr = htonl(INADDR_ANY);
   destAddr.sin_family = AF_INET;
   destAddr.sin_port = htons(5000);
-  addr_family = AF_INET;
-  ip_protocol = IPPROTO_IP;
-  inet_ntoa_r(destAddr.sin_addr, addr_str, sizeof(addr_str) - 1);
-    serverSock = socket(addr_family, SOCK_STREAM, ip_protocol);
+
+  serverSock = socket(AF_INET, udp ? SOCK_DGRAM : SOCK_STREAM,
+                      udp ? IPPROTO_UDP : IPPROTO_IP);
   if (serverSock < 0) {
     ESP_LOGE(TAG, "Unable to create socket: errno %d", errno);
+    return;
   }
   ESP_LOGD(TAG, "Socket created");
 
   int err = bind(serverSock, (struct sockaddr *)&destAddr, sizeof(destAddr));
   if (err != 0) {
     ESP_LOGE(TAG, "Socket unable to bind: errno %d", errno);
+    return;
   }
   ESP_LOGD(TAG, "Socket binded");
 
-  err = listen(serverSock, 1);
-  if (err != 0) {
-    ESP_LOGE(TAG, "Error occured during listen: errno %d", errno);
+  if (!udp) {
+    err = listen(serverSock, 1);
+    if (err != 0) {
+      ESP_LOGE(TAG, "Error occured during listen: errno %d", errno);
+    }
+    ESP_LOGD(TAG, "Socket listening");
   }
-  ESP_LOGD(TAG, "Socket listening");
+  ESP_LOGI(TAG, "%s socket bound to :5000", udp ? "UDP" : "TCP");
 }
 
 void wifi_wait_for_socket_connected() {
@@ -371,9 +418,23 @@ static void wifi_task(void *pvParameters) {
   ESP_ERROR_CHECK(esp_wifi_get_mac(WIFI_IF_STA, mac));
   ESP_LOGD(TAG, "STA MAC is %x:%x:%x:%x:%x:%x", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
+  xEventGroupSetBits(startUpEventGroup, START_UP_MAIN_TASK);
+
+  // Wait until the GAP8 has chosen the transport and asked to connect, so the
+  // server socket is the right type. Binding after esp_wifi_start() is fine.
+  xSemaphoreTake(serveReadySem, portMAX_DELAY);
   wifi_bind_socket();
 
-  xEventGroupSetBits(startUpEventGroup, START_UP_MAIN_TASK);
+  if (transportMode == WIFI_TRANSPORT_UDP) {
+    // Connectionless: there is nothing to accept and no disconnect to wait on.
+    // The RX task learns the host address from the FER magic datagram and signals
+    // the GAP8; this task has no further work.
+    ESP_LOGI(TAG, "UDP transport: waiting for host FER datagram");
+    while (1) {
+      vTaskDelay(portMAX_DELAY);
+    }
+  }
+
   while (1) {
     //blink_period_ms = 500;
     wifi_wait_for_socket_connected();
@@ -417,9 +478,13 @@ static void wifi_status_task(void *pvParameters)
     uint32_t spiTransactions = 0, spiTxPackets = 0, spiRxPackets = 0;
     int gapRtt = 0, spiArmed = 0;
     spi_transport_debug(&spiTransactions, &spiTxPackets, &spiRxPackets, &gapRtt, &spiArmed);
-    ESP_LOGI(TAG, "status: heap %u (min %u), client %s, txq %u enq %u deq %u send %u bytes %u",
+    const char *clientState = (transportMode == WIFI_TRANSPORT_UDP)
+                                  ? (udpClientKnown ? "yes" : "no")
+                                  : (clientConnection == NO_CONNECTION ? "no" : "yes");
+    ESP_LOGI(TAG, "status: %s heap %u (min %u), client %s, txq %u enq %u deq %u send %u bytes %u",
+             transportMode == WIFI_TRANSPORT_UDP ? "UDP" : "TCP",
              (unsigned)esp_get_free_heap_size(), (unsigned)esp_get_minimum_free_heap_size(),
-             clientConnection == NO_CONNECTION ? "no" : "yes",
+             clientState,
              (unsigned)uxQueueMessagesWaiting(wifiTxQueue),
              (unsigned)wifiTxEnqueued, (unsigned)wifiTxDequeued,
              (unsigned)wifiSendCalls, (unsigned)wifiBytesWritten);
@@ -452,6 +517,29 @@ void wifi_led_task(void *pvParameters)
 }
 
 void wifi_send_packet(const char * buffer, size_t size) {
+  if (transportMode == WIFI_TRANSPORT_UDP) {
+    // Fail-fast, drop-on-error datagram send. Dropping (rather than blocking to
+    // retry, as TCP does) is exactly what keeps a stalled host from starving the
+    // WiFi driver's heap and killing the radio - the reason UDP survives raw
+    // streaming. Never blocks the GAP8 route.
+    if (serverSock < 0 || !udpClientKnown) {
+      return;
+    }
+    wifiSendCalls++;
+    struct sockaddr_in target;
+    xSemaphoreTake(udpTargetLock, portMAX_DELAY);
+    target = udpDestAddr;
+    xSemaphoreGive(udpTargetLock);
+    int sent = sendto(serverSock, buffer, size, 0,
+                      (struct sockaddr *)&target, sizeof(target));
+    if (sent > 0) {
+      wifiBytesWritten += sent;
+    } else {
+      ESP_LOGD(TAG, "UDP send dropped: errno %d", errno);
+    }
+    return;
+  }
+
   if (clientConnection == NO_CONNECTION) {
     return;
   }
@@ -514,6 +602,60 @@ static void wifi_receiving_task(void *pvParameters) {
 
   xEventGroupSetBits(startUpEventGroup, START_UP_RX_TASK);
   while (1) {
+    if (transportMode == WIFI_TRANSPORT_UDP) {
+      if (serverSock < 0) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+        continue;
+      }
+      struct sockaddr_in src;
+      socklen_t srcLen = sizeof(src);
+      int len = recvfrom(serverSock, &rxp_wifi, sizeof(rxp_wifi), 0,
+                         (struct sockaddr *)&src, &srcLen);
+      if (len <= 0) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+        continue;
+      }
+
+      // "FER" magic: the host announcing its address (and, on the host's read
+      // timeout, re-announcing). Lock onto its source addr:port and, the first
+      // time, tell the GAP8 a client is connected so it starts streaming. This
+      // replaces the LARICS fork's unconditional 5 s "connected" spam that made
+      // the deck stream into the void from boot.
+      if (len == 3 && memcmp(&rxp_wifi, "FER", 3) == 0) {
+        xSemaphoreTake(udpTargetLock, portMAX_DELAY);
+        udpDestAddr = src;
+        xSemaphoreGive(udpTargetLock);
+        bool wasKnown = udpClientKnown;
+        udpClientKnown = true;
+        if (!wasKnown) {
+          uint32_t a = src.sin_addr.s_addr;
+          ESP_LOGI(TAG, "UDP client %u.%u.%u.%u:%u",
+                   (unsigned)(a & 0xff), (unsigned)((a >> 8) & 0xff),
+                   (unsigned)((a >> 16) & 0xff), (unsigned)((a >> 24) & 0xff),
+                   (unsigned)ntohs(src.sin_port));
+          wifi_signal_client_connected(1);
+        }
+        continue;
+      }
+
+      // Genuine host->deck CPX packet: 2-byte length prefix + payload, one whole
+      // packet per datagram. Validate strictly against the datagram bounds - the
+      // LARICS fork trusted the wire length blindly, so a short/garbage datagram
+      // underflowed dataLength in wifi_transport_receive and memcpy'd ~64 KB.
+      if (len < 2) {
+        continue;
+      }
+      if (rxp_wifi.payloadLength != (uint16_t)(len - 2) ||
+          rxp_wifi.payloadLength < CPX_ROUTING_PACKED_SIZE ||
+          rxp_wifi.payloadLength > WIFI_TRANSPORT_MTU) {
+        ESP_LOGD(TAG, "Dropping malformed UDP packet: len %d, wire %u",
+                 len, rxp_wifi.payloadLength);
+        continue;
+      }
+      xQueueSend(wifiRxQueue, &rxp_wifi, portMAX_DELAY);
+      continue;
+    }
+
     if (clientConnection == NO_CONNECTION) {
       vTaskDelay(10);
       continue;
@@ -539,7 +681,8 @@ static void wifi_receiving_task(void *pvParameters) {
       continue;
     }
 
-    if (rxp_wifi.payloadLength > WIFI_TRANSPORT_MTU) {
+    if (rxp_wifi.payloadLength < CPX_ROUTING_PACKED_SIZE ||
+        rxp_wifi.payloadLength > WIFI_TRANSPORT_MTU) {
       ESP_LOGE(TAG, "Bad wire length %i, closing connection", rxp_wifi.payloadLength);
       close_client_socket();
       continue;
@@ -577,7 +720,17 @@ void wifi_transport_receive(CPXRoutablePacket_t* packet) {
   static WifiTransportPacket_t qPacket;
   xQueueReceive(wifiRxQueue, &qPacket, portMAX_DELAY);
 
-  packet->dataLength = qPacket.payloadLength - CPX_ROUTING_PACKED_SIZE;
+  // Clamp before subtracting CPX_ROUTING_PACKED_SIZE: an out-of-range wire length
+  // would otherwise underflow dataLength (uint16) to ~64 KB and overrun the
+  // memcpy below. The RX tasks already reject these, but keep the guard here so
+  // a bad enqueue can never corrupt memory.
+  uint16_t payloadLength = qPacket.payloadLength;
+  if (payloadLength < CPX_ROUTING_PACKED_SIZE) {
+    payloadLength = CPX_ROUTING_PACKED_SIZE;
+  } else if (payloadLength > WIFI_TRANSPORT_MTU) {
+    payloadLength = WIFI_TRANSPORT_MTU;
+  }
+  packet->dataLength = payloadLength - CPX_ROUTING_PACKED_SIZE;
 
   cpxPackedToRoute(&qPacket.routablePayload.route, &packet->route);
 
@@ -593,6 +746,8 @@ void wifi_init() {
   wifiTxQueue = xQueueCreate(WIFI_HOST_QUEUE_LENGTH, sizeof(CPXRoutablePacket_t));
 
   socketCloseLock = xSemaphoreCreateMutex();
+  udpTargetLock = xSemaphoreCreateMutex();
+  serveReadySem = xSemaphoreCreateBinary();
 
   startUpEventGroup = xEventGroupCreate();
   xEventGroupClearBits(startUpEventGroup, START_UP_MAIN_TASK | START_UP_RX_TASK | START_UP_TX_TASK | START_UP_CTRL_TASK);
