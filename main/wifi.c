@@ -84,6 +84,17 @@ static EventGroupHandle_t startUpEventGroup;
 // forever.
 #define WIFI_SEND_TIMEOUT_MAX (5)
 
+// How often the TCP control loop re-asserts CLIENT_CONNECTED to the GAP8 while
+// a client is connected. The one accept-time notification crosses the
+// unacknowledged ESP<->GAP8 SPI link and can be dropped there; a TCP client
+// (unlike a UDP one, whose periodic FER re-announce drives a re-signal) sends
+// nothing after connecting, so the ESP must retransmit the notification itself
+// or the GAP8 can gate on it forever and never emit a first frame. The GAP8
+// makes a repeat idempotent, so this doubles as a cheap keepalive once the
+// first one lands. ~1 s bounds recovery from a dropped notification to about
+// one interval while costing only two 2-byte control packets per second.
+#define WIFI_CLIENT_CONNECTED_REASSERT_MS (1000)
+
 static QueueHandle_t wifiRxQueue;
 static QueueHandle_t wifiTxQueue;
 static volatile uint32_t wifiTxEnqueued;
@@ -398,8 +409,14 @@ void wifi_wait_for_socket_connected() {
   }
 }
 
-void wifi_wait_for_disconnect() {
-  xEventGroupWaitBits(s_wifi_event_group, WIFI_SOCKET_DISCONNECTED, pdTRUE, pdFALSE, portMAX_DELAY);
+// Wait up to `timeout` ticks for the client socket to drop. Returns true if it
+// disconnected (the bit was set and is cleared on exit), false if the wait timed
+// out with the client still connected - which the control loop uses to re-assert
+// the connected notification without blocking indefinitely.
+bool wifi_wait_for_disconnect(TickType_t timeout) {
+  EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group, WIFI_SOCKET_DISCONNECTED,
+                                         pdTRUE, pdFALSE, timeout);
+  return (bits & WIFI_SOCKET_DISCONNECTED) != 0;
 }
 
 static void wifi_task(void *pvParameters) {
@@ -442,29 +459,23 @@ static void wifi_task(void *pvParameters) {
 
     //blink_period_ms = 100;
 
-    // Not thread safe!
-    cpxInitRoute(CPX_T_ESP32, CPX_T_GAP8, CPX_F_WIFI_CTRL, &txp.route);
-    txp.data[0] = WIFI_CTRL_STATUS_CLIENT_CONNECTED;
-    txp.data[1] = 1;    // connected
-    txp.dataLength = 2;
-    espAppSendToRouterBlocking(&txp);
-
-    txp.route.destination = CPX_T_STM32;
-    espAppSendToRouterBlocking(&txp);
-
-    // Probably not the best, should be handled in some other way?
-    wifi_wait_for_disconnect();
+    // Tell the GAP8 (and STM32) a client is connected so the GAP8 leaves its
+    // pre-client gate and starts streaming, then re-assert on a fixed interval
+    // until the client drops. The single accept-time packet can be lost on the
+    // unacknowledged ESP<->GAP8 SPI link, and a TCP client sends nothing after
+    // connecting (so there is no host-driven re-signal like UDP's FER); without
+    // the periodic re-assert a dropped notification wedges the GAP8 forever with
+    // no first frame. The GAP8 makes repeats idempotent - they neither restart
+    // its settle timer nor republish an event - so the re-assert is a free
+    // no-op once the first one lands. Routing through wifi_signal_client_connected()
+    // also keeps this off the shared, non-thread-safe txp packet.
+    wifi_signal_client_connected(1);
+    while (!wifi_wait_for_disconnect(pdMS_TO_TICKS(WIFI_CLIENT_CONNECTED_REASSERT_MS))) {
+      wifi_signal_client_connected(1);
+    }
     ESP_LOGI(TAG, "Client disconnected");
 
-    // Not thread safe!
-    cpxInitRoute(CPX_T_ESP32, CPX_T_GAP8, CPX_F_WIFI_CTRL, &txp.route);
-    txp.data[0] = WIFI_CTRL_STATUS_CLIENT_CONNECTED;
-    txp.data[1] = 0;    // disconnected
-    txp.dataLength = 2;
-    espAppSendToRouterBlocking(&txp);
-
-    txp.route.destination = CPX_T_STM32;
-    espAppSendToRouterBlocking(&txp);
+    wifi_signal_client_connected(0);
   }
 }
 
@@ -617,10 +628,10 @@ static void wifi_receiving_task(void *pvParameters) {
       }
 
       // "FER" magic: the host announcing its address (and, on the host's read
-      // timeout, re-announcing). Lock onto its source addr:port and, the first
-      // time, tell the GAP8 a client is connected so it starts streaming. This
-      // replaces the LARICS fork's unconditional 5 s "connected" spam that made
-      // the deck stream into the void from boot.
+      // timeout, re-announcing). Lock onto its source addr:port and repeat the
+      // idempotent GAP8 notification as well. A control packet can be lost in
+      // the shallow CPX queues; suppressing later notifications then leaves the
+      // ESP with a client while the GAP8 waits forever and emits no first frame.
       if (len == 3 && memcmp(&rxp_wifi, "FER", 3) == 0) {
         xSemaphoreTake(udpTargetLock, portMAX_DELAY);
         udpDestAddr = src;
@@ -633,8 +644,8 @@ static void wifi_receiving_task(void *pvParameters) {
                    (unsigned)(a & 0xff), (unsigned)((a >> 8) & 0xff),
                    (unsigned)((a >> 16) & 0xff), (unsigned)((a >> 24) & 0xff),
                    (unsigned)ntohs(src.sin_port));
-          wifi_signal_client_connected(1);
         }
+        wifi_signal_client_connected(1);
         continue;
       }
 
