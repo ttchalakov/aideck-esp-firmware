@@ -492,10 +492,11 @@ static void wifi_status_task(void *pvParameters)
     const char *clientState = (transportMode == WIFI_TRANSPORT_UDP)
                                   ? (udpClientKnown ? "yes" : "no")
                                   : (clientConnection == NO_CONNECTION ? "no" : "yes");
-    ESP_LOGI(TAG, "status: %s heap %u (min %u), client %s, txq %u enq %u deq %u send %u bytes %u",
+    ESP_LOGI(TAG, "status: %s heap %u (min %u), client %s, spiRej %u, txq %u enq %u deq %u send %u bytes %u",
              transportMode == WIFI_TRANSPORT_UDP ? "UDP" : "TCP",
              (unsigned)esp_get_free_heap_size(), (unsigned)esp_get_minimum_free_heap_size(),
              clientState,
+             (unsigned)spi_transport_rx_rejects(),
              (unsigned)uxQueueMessagesWaiting(wifiTxQueue),
              (unsigned)wifiTxEnqueued, (unsigned)wifiTxDequeued,
              (unsigned)wifiSendCalls, (unsigned)wifiBytesWritten);

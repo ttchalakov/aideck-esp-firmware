@@ -37,6 +37,7 @@
 
 #include "driver/gpio.h"
 #include "driver/spi_slave.h"
+#include <stdbool.h>
 #include "esp_log.h"
 
 #define GAP_RTT_GPIO 32
@@ -73,6 +74,7 @@ static TaskHandle_t spi_task_handle;
 static volatile uint32_t spiTransactionCount;
 static volatile uint32_t spiTxPacketCount;
 static volatile uint32_t spiRxPacketCount;
+static volatile uint32_t spiRxRejectCount;
 static volatile int spiArmed;
 
 void spi_transport_debug(uint32_t *transactions, uint32_t *txPackets,
@@ -165,8 +167,23 @@ static void spi_task(void* _param) {
 
         int rx_len  = rx_buffer->structuredData.dataLength;
 
+        // The length is chosen by the GAP8 and must never be trusted: it is read
+        // straight out of a DMA buffer, so a GAP8 running foreign firmware with a
+        // different SPI framing -- or one corrupted transfer -- can name any 16-bit
+        // size. Unchecked, the memcpy() below writes up to 64 kB into a ~1 kB static
+        // packet, smashing .bss including the FreeRTOS queue structs next to it; the
+        // next xQueueSend() then panics. Hardware-observed 2026-08-30: that put the
+        // ESP in a silent reboot loop before uart_transport_init(), so CPX never came
+        // up and every bcAI:gap8 flash stalled at 0% -- and the GAP8 can only be
+        // reflashed *through* this firmware. The underflow guard matters as much:
+        // rx_len below CPX_ROUTING_PACKED_SIZE wraps the subtraction into a huge len.
+        const bool rx_len_valid = (rx_len >= CPX_ROUTING_PACKED_SIZE) &&
+                                  (rx_len <= SPI_TRANSPORT_MTU);
+
         // If there is some data received, push the packet in the RX queue!
-        if (rx_len != 0) {
+        if (rx_len != 0 && !rx_len_valid) {
+            spiRxRejectCount++;
+        } else if (rx_len != 0) {
             spiRxPacketCount++;
             qPacket.dataLength = rx_len - CPX_ROUTING_PACKED_SIZE;
 
@@ -253,4 +270,8 @@ void spi_transport_send(const CPXRoutablePacket_t* packet) {
 
 void spi_transport_receive(CPXRoutablePacket_t* packet) {
     xQueueReceive(rx_queue, packet, portMAX_DELAY);
+}
+
+uint32_t spi_transport_rx_rejects(void) {
+    return spiRxRejectCount;
 }

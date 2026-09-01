@@ -58,3 +58,6 @@ void spi_transport_receive(CPXRoutablePacket_t* packet);
 // currently armed (ESP RTT high).
 void spi_transport_debug(uint32_t *transactions, uint32_t *txPackets,
                          uint32_t *rxPackets, int *gapRttLevel, int *armed);
+
+// Count of SPI frames dropped because the GAP8 named an out-of-range length.
+uint32_t spi_transport_rx_rejects(void);
