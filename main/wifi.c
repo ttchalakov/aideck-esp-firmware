@@ -116,6 +116,7 @@ static int clientConnection = NO_CONNECTION;
 enum {
   WIFI_CTRL_SET_SSID                = 0x10,
   WIFI_CTRL_SET_KEY                 = 0x11,
+  WIFI_CTRL_SET_CHANNEL             = 0x12,
 
   WIFI_CTRL_WIFI_CONNECT            = 0x20,
   WIFI_CTRL_SET_TRANSPORT           = 0x21,
@@ -134,6 +135,14 @@ enum {
   WIFI_TRANSPORT_UDP = 1,
 };
 static volatile uint8_t transportMode = WIFI_TRANSPORT_TCP;
+
+// Access point channel, chosen by the GAP8 (WIFI_CTRL_SET_CHANNEL) before it asks
+// to connect. Channel 1, the old default, was the most congested band in this lab,
+// and RF retry pressure deepens the driver TX queues and helps trip the low-heap
+// radio failure under streaming load; 6 is the default for an app that never says.
+#define AP_DEFAULT_CHANNEL 6
+#define AP_MAX_CHANNEL 13
+static uint8_t apChannel = AP_DEFAULT_CHANNEL;
 
 // UDP host address, learned from the source of the "FER" magic datagram. Guarded
 // by udpTargetLock because the RX task writes it and the TX task reads it.
@@ -240,10 +249,7 @@ static void wifi_init_softap(const char *ssid, const char* key)
   wifi_config_t wifi_config = {
       .ap = {
           .ssid_len = strlen(ssid),
-          // Default was channel 1, the most congested band in this lab; RF
-          // retry pressure deepens the driver TX queues and helps trip the
-          // low-heap radio failure under streaming load.
-          .channel = 6,
+          .channel = apChannel,
           .max_connection = 1,
           .authmode = WIFI_AUTH_OPEN},
   };
@@ -258,7 +264,7 @@ static void wifi_init_softap(const char *ssid, const char* key)
   ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
   ESP_ERROR_CHECK(esp_wifi_start());
 
-  ESP_LOGI(TAG, "wifi_init_softap finished");
+  ESP_LOGI(TAG, "wifi_init_softap finished (channel %u)", apChannel);
 }
 
 static void wifi_init_sta(const char * ssid, const char * key)
@@ -301,6 +307,13 @@ static void wifi_ctrl(void* _param) {
         key[rxp.dataLength - 1 + 1] = 0;
         ESP_LOGD(TAG, "KEY: %s", key);
         // Save to NVS?
+        break;
+      case WIFI_CTRL_SET_CHANNEL:
+        if (1 <= rxp.data[1] && rxp.data[1] <= AP_MAX_CHANNEL) {
+          apChannel = rxp.data[1];
+        } else {
+          ESP_LOGW(TAG, "Ignoring AP channel %u", rxp.data[1]);
+        }
         break;
       case WIFI_CTRL_SET_TRANSPORT:
         transportMode = (rxp.data[1] == WIFI_TRANSPORT_UDP) ? WIFI_TRANSPORT_UDP
