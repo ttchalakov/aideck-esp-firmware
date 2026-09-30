@@ -22,10 +22,12 @@
  * along with this program. If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <stdarg.h>
 #include <stdio.h>
 #include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "esp_system.h"
 
 #include "driver/gpio.h"
@@ -111,14 +113,31 @@
 //     printf("Done in %f ms, %f pk/s, %f B/s\n", runtime * 1000, pk_per_seconds, pk_per_seconds * ESP_TRANSPORT_MTU);
 // }
 
+// ESP-IDF logs from any task through here, so the one packet buffer is shared
+// under a mutex, and the argument list, consumed by vprintf, is copied first.
+// A log line never waits for the router: the WiFi and SPI tasks log from the
+// data path, and if the route to the STM32 is backed up, waiting there would
+// stop their traffic for good. A line that finds the queue full is dropped.
 static esp_routable_packet_t txp;
+static SemaphoreHandle_t txpLock;
 int cpx_and_uart_vprintf(const char * fmt, va_list ap) {
+    va_list copy;
+    va_copy(copy, ap);
     int len = vprintf(fmt, ap);
 
-    cpxInitRoute(CPX_T_ESP32, CPX_T_STM32, CPX_F_CONSOLE, &txp.route);
-    txp.dataLength = vsprintf((char*)txp.data, fmt, ap) + 1;
-    espAppSendToRouterBlocking(&txp);
-
+    if (txpLock != NULL && xSemaphoreTake(txpLock, portMAX_DELAY) == pdTRUE) {
+        cpxInitRoute(CPX_T_ESP32, CPX_T_STM32, CPX_F_CONSOLE, &txp.route);
+        int n = vsnprintf((char*)txp.data, sizeof(txp.data), fmt, copy);
+        if (n >= 0) {
+            if (n >= (int)sizeof(txp.data)) {
+                n = sizeof(txp.data) - 1;
+            }
+            txp.dataLength = n + 1;
+            espAppSendToRouter(&txp, 0);
+        }
+        xSemaphoreGive(txpLock);
+    }
+    va_end(copy);
     return len;
 }
 
@@ -178,6 +197,7 @@ void app_main(void)
     wifi_init();
     router_init();
 
+    txpLock = xSemaphoreCreateMutex();
     esp_log_set_vprintf(cpx_and_uart_vprintf);
 
     system_init();

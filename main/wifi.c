@@ -154,17 +154,24 @@ static SemaphoreHandle_t udpTargetLock;
 // WiFi is up, so wifi_task binds the right kind of socket.
 static SemaphoreHandle_t serveReadySem;
 
-// Tell the GAP8 (and STM32) whether a host is connected. Used from the UDP RX
-// task on the first FER datagram; the TCP path signals the same from wifi_task.
+// Tell the GAP8 whether a host is connected, and the STM32 too when the state
+// changes. Used from the UDP RX task on each FER datagram; the TCP path signals
+// the same from wifi_task, re-asserting every second. Only the GAP8 needs the
+// repeats (they recover a notification lost on SPI); the STM32 would print
+// "CPX connected" for every one.
 static void wifi_signal_client_connected(uint8_t connected) {
   static esp_routable_packet_t p;
+  static int lastToStm32 = -1;
   cpxInitRoute(CPX_T_ESP32, CPX_T_GAP8, CPX_F_WIFI_CTRL, &p.route);
   p.data[0] = WIFI_CTRL_STATUS_CLIENT_CONNECTED;
   p.data[1] = connected;
   p.dataLength = 2;
   espAppSendToRouterBlocking(&p);
-  p.route.destination = CPX_T_STM32;
-  espAppSendToRouterBlocking(&p);
+  if (lastToStm32 != connected) {
+    lastToStm32 = connected;
+    p.route.destination = CPX_T_STM32;
+    espAppSendToRouterBlocking(&p);
+  }
 }
 
 /* WiFi event handler */
@@ -632,14 +639,23 @@ static void wifi_receiving_task(void *pvParameters) {
         vTaskDelay(pdMS_TO_TICKS(10));
         continue;
       }
+      // One byte more than the largest valid packet: recvfrom() truncates a
+      // longer datagram to the buffer, and the truncated prefix would pass the
+      // length check below, so a datagram that fills this buffer is too long.
+      static uint8_t datagram[sizeof(WifiTransportPacket_t) + 1];
       struct sockaddr_in src;
       socklen_t srcLen = sizeof(src);
-      int len = recvfrom(serverSock, &rxp_wifi, sizeof(rxp_wifi), 0,
+      int len = recvfrom(serverSock, datagram, sizeof(datagram), 0,
                          (struct sockaddr *)&src, &srcLen);
       if (len <= 0) {
         vTaskDelay(pdMS_TO_TICKS(10));
         continue;
       }
+      if (len > (int)sizeof(WifiTransportPacket_t)) {
+        ESP_LOGD(TAG, "Dropping oversized UDP datagram");
+        continue;
+      }
+      memcpy(&rxp_wifi, datagram, len);
 
       // "FER" magic: the host announcing its address (and, on the host's read
       // timeout, re-announcing). Lock onto its source addr:port and repeat the
@@ -698,10 +714,14 @@ static void wifi_receiving_task(void *pvParameters) {
       headerLen += len;
     }
     if (headerLen < 2) {
-      if (len == 0) {
-        close_client_socket();  //Reading 0 bytes most often means the client has disconnected.
+      // 0 is the client's FIN. An error is final too (a reset, or the socket the
+      // TX task already closed), except a signal or a spurious wake-up: retrying
+      // on a reset connection left an idle client open forever, and with it the
+      // single-client server, since nothing on the send side notices.
+      if (len == 0 || (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK)) {
+        close_client_socket();
       } else {
-        vTaskDelay(10);
+        vTaskDelay(pdMS_TO_TICKS(10));
       }
       continue;
     }

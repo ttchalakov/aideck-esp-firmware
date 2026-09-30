@@ -29,6 +29,8 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <stdbool.h>
+#include "freertos/FreeRTOS.h"
 #include "cpx.h"
 
 #include "spi_transport.h"
@@ -47,6 +49,8 @@ void espTransportInit();
 
 // Interface used by ESP applications to exchange CPX packets with other part of the system
 void espAppSendToRouterBlocking(const esp_routable_packet_t* packet);
+// As above, but gives up after timeout ticks; true when the packet was queued.
+bool espAppSendToRouter(const esp_routable_packet_t* packet, TickType_t timeout);
 void espAppReceiveFromRouter(esp_routable_packet_t* packet);
 
 

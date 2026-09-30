@@ -138,7 +138,7 @@ static void uart_tx_task(void* _param) {
       txp.start = 0xFF;
       txp.payloadLength = qPacket.dataLength + CPX_ROUTING_PACKED_SIZE;
       cpxRouteToPacked(&qPacket.route, &txp.routablePayload.route);
-      memcpy(txp.routablePayload.data, qPacket.data, txp.payloadLength);
+      memcpy(txp.routablePayload.data, qPacket.data, qPacket.dataLength);
       txp.payload[txp.payloadLength] = calcCrc(&txp);
 
       do {

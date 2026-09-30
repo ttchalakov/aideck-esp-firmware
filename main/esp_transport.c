@@ -53,6 +53,10 @@ void espAppSendToRouterBlocking(const esp_routable_packet_t* packet) {
   xQueueSend(espTxQueue, packet, portMAX_DELAY);
 }
 
+bool espAppSendToRouter(const esp_routable_packet_t* packet, TickType_t timeout) {
+  return xQueueSend(espTxQueue, packet, timeout) == pdTRUE;
+}
+
 void espAppReceiveFromRouter(esp_routable_packet_t* packet) {
   CPXRoutablePacket_t* buf = packet;
   xQueueReceive(espRxQueue, buf, portMAX_DELAY);
