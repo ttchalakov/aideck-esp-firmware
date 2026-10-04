@@ -54,13 +54,14 @@
 static esp_routable_packet_t rxp;
 static esp_routable_packet_t txp;
 
-#define MAX_SSID_SIZE (50)
+// An 802.11 SSID is at most 32 bytes, as in wifi_config_t; one more for the terminator.
+#define MAX_SSID_SIZE (33)
 #define MAX_PASSWD_SIZE (50)
 // A DNS label is at most 63 bytes; the TXT name gets the same bound.
 #define MAX_NAME_SIZE (64)
 
 static char ssid[MAX_SSID_SIZE];
-static char key[MAX_SSID_SIZE];
+static char key[MAX_PASSWD_SIZE];
 
 static const int WIFI_CONNECTED_BIT = BIT0;
 static const int WIFI_SOCKET_DISCONNECTED = BIT1;
@@ -264,9 +265,9 @@ static void wifi_init_softap(const char *ssid, const char* key)
           .max_connection = 1,
           .authmode = WIFI_AUTH_OPEN},
   };
-  strncpy((char *)wifi_config.ap.ssid, ssid, strlen(ssid));
+  strncpy((char *)wifi_config.ap.ssid, ssid, sizeof(wifi_config.ap.ssid));
   if (strlen(key) > 0) {
-    strncpy((char *)wifi_config.ap.password, key, strlen(key));
+    strncpy((char *)wifi_config.ap.password, key, sizeof(wifi_config.ap.password));
     wifi_config.ap.authmode = WIFI_AUTH_WPA_WPA2_PSK;
   }
 
@@ -285,9 +286,9 @@ static void wifi_init_sta(const char * ssid, const char * key)
 
   wifi_config_t wifi_config;
   memset((void *)&wifi_config, 0, sizeof(wifi_config_t));
-  strncpy((char *)wifi_config.sta.ssid, ssid, strlen(ssid));
+  strncpy((char *)wifi_config.sta.ssid, ssid, sizeof(wifi_config.sta.ssid));
   ESP_LOGD(TAG, "SSID is %u chars", strlen(ssid));
-  strncpy((char *)wifi_config.sta.password, key, strlen(key));
+  strncpy((char *)wifi_config.sta.password, key, sizeof(wifi_config.sta.password));
   ESP_LOGD(TAG, "KEY is %u chars", strlen(key));
 
   ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA) );
@@ -304,10 +305,16 @@ static void wifi_ctrl(void* _param) {
   while (1) {
     com_receive_wifi_ctrl_blocking(&rxp);
 
+    // An empty packet has no command byte; data[0] would be a stale one.
+    if (rxp.dataLength == 0) {
+      ESP_LOGW(TAG, "Ignoring empty control packet");
+      continue;
+    }
+
     switch (rxp.data[0]) {
       case WIFI_CTRL_SET_SSID: {
         // The string, unterminated; it and its terminator must fit in ssid.
-        const size_t length = rxp.dataLength > 0 ? rxp.dataLength - 1 : 0;
+        const size_t length = rxp.dataLength - 1;
         if (length >= sizeof(ssid)) {
           ESP_LOGW(TAG, "Ignoring %u-byte SSID", length);
         } else {
@@ -318,7 +325,7 @@ static void wifi_ctrl(void* _param) {
         break;
       }
       case WIFI_CTRL_SET_KEY: {
-        const size_t length = rxp.dataLength > 0 ? rxp.dataLength - 1 : 0;
+        const size_t length = rxp.dataLength - 1;
         if (length >= sizeof(key)) {
           ESP_LOGW(TAG, "Ignoring %u-byte key", length);
         } else {
@@ -339,7 +346,7 @@ static void wifi_ctrl(void* _param) {
         // "<hostname>\0<name>\0" from the GAP8 app's build, e.g. "cf-80-2m-e7e7e7e7e7"
         // and "80/2M/E7E7E7E7E7": the name the host looks the deck up by. Both
         // strings must end inside the packet.
-        const size_t length = rxp.dataLength > 0 ? rxp.dataLength - 1 : 0;
+        const size_t length = rxp.dataLength - 1;
         const char *hostname = (const char *)&rxp.data[1];
         const size_t hostnameLength = strnlen(hostname, length);
         const char *name = hostname + hostnameLength + 1;
