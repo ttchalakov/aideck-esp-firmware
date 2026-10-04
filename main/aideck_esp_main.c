@@ -195,14 +195,15 @@ void app_main(void)
     test_init();
 
     wifi_init();
+    // Before the router starts delivering GAP8 packets: the GAP8 renames the deck
+    // (WIFI_CTRL_SET_NAME) as soon as it can, and that needs mDNS up.
+    discovery_init();
     router_init();
 
     txpLock = xSemaphoreCreateMutex();
     esp_log_set_vprintf(cpx_and_uart_vprintf);
 
     system_init();
-
-    discovery_init();
 
     while(1) {
         vTaskDelay(20);

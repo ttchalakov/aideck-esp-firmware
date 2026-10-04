@@ -47,6 +47,7 @@
 #include "esp_mac.h"
 
 #include "com.h"
+#include "discovery.h"
 #include "spi_transport.h"
 #define BLINK_GPIO 4
 
@@ -55,6 +56,8 @@ static esp_routable_packet_t txp;
 
 #define MAX_SSID_SIZE (50)
 #define MAX_PASSWD_SIZE (50)
+// A DNS label is at most 63 bytes; the TXT name gets the same bound.
+#define MAX_NAME_SIZE (64)
 
 static char ssid[MAX_SSID_SIZE];
 static char key[MAX_SSID_SIZE];
@@ -117,6 +120,7 @@ enum {
   WIFI_CTRL_SET_SSID                = 0x10,
   WIFI_CTRL_SET_KEY                 = 0x11,
   WIFI_CTRL_SET_CHANNEL             = 0x12,
+  WIFI_CTRL_SET_NAME                = 0x13,
 
   WIFI_CTRL_WIFI_CONNECT            = 0x20,
   WIFI_CTRL_SET_TRANSPORT           = 0x21,
@@ -301,20 +305,29 @@ static void wifi_ctrl(void* _param) {
     com_receive_wifi_ctrl_blocking(&rxp);
 
     switch (rxp.data[0]) {
-      case WIFI_CTRL_SET_SSID:
-        ESP_LOGD("WIFI", "Should set SSID");
-        memcpy(ssid, &rxp.data[1], rxp.dataLength - 1);
-        ssid[rxp.dataLength - 1 + 1] = 0;
-        ESP_LOGD(TAG, "SSID: %s", ssid);
-        // Save to NVS?
+      case WIFI_CTRL_SET_SSID: {
+        // The string, unterminated; it and its terminator must fit in ssid.
+        const size_t length = rxp.dataLength > 0 ? rxp.dataLength - 1 : 0;
+        if (length >= sizeof(ssid)) {
+          ESP_LOGW(TAG, "Ignoring %u-byte SSID", length);
+        } else {
+          memcpy(ssid, &rxp.data[1], length);
+          ssid[length] = 0;
+          ESP_LOGD(TAG, "SSID: %s", ssid);
+        }
         break;
-      case WIFI_CTRL_SET_KEY:
-        ESP_LOGD("WIFI", "Should set password");
-        memcpy(key, &rxp.data[1], rxp.dataLength - 1);
-        key[rxp.dataLength - 1 + 1] = 0;
-        ESP_LOGD(TAG, "KEY: %s", key);
-        // Save to NVS?
+      }
+      case WIFI_CTRL_SET_KEY: {
+        const size_t length = rxp.dataLength > 0 ? rxp.dataLength - 1 : 0;
+        if (length >= sizeof(key)) {
+          ESP_LOGW(TAG, "Ignoring %u-byte key", length);
+        } else {
+          memcpy(key, &rxp.data[1], length);
+          key[length] = 0;
+          ESP_LOGD(TAG, "KEY: %s", key);
+        }
         break;
+      }
       case WIFI_CTRL_SET_CHANNEL:
         if (1 <= rxp.data[1] && rxp.data[1] <= AP_MAX_CHANNEL) {
           apChannel = rxp.data[1];
@@ -322,6 +335,23 @@ static void wifi_ctrl(void* _param) {
           ESP_LOGW(TAG, "Ignoring AP channel %u", rxp.data[1]);
         }
         break;
+      case WIFI_CTRL_SET_NAME: {
+        // "<hostname>\0<name>\0" from the GAP8 app's build, e.g. "cf-80-2m-e7e7e7e7e7"
+        // and "80/2M/E7E7E7E7E7": the name the host looks the deck up by. Both
+        // strings must end inside the packet.
+        const size_t length = rxp.dataLength > 0 ? rxp.dataLength - 1 : 0;
+        const char *hostname = (const char *)&rxp.data[1];
+        const size_t hostnameLength = strnlen(hostname, length);
+        const char *name = hostname + hostnameLength + 1;
+        const size_t nameLength = hostnameLength < length ? strnlen(name, length - hostnameLength - 1) : 0;
+        if (hostnameLength == 0 || hostnameLength + nameLength + 2 > length ||
+            hostnameLength >= MAX_NAME_SIZE || nameLength >= MAX_NAME_SIZE) {
+          ESP_LOGW(TAG, "Ignoring malformed name");
+        } else {
+          discovery_set_name(hostname, name);
+        }
+        break;
+      }
       case WIFI_CTRL_SET_TRANSPORT:
         transportMode = (rxp.data[1] == WIFI_TRANSPORT_UDP) ? WIFI_TRANSPORT_UDP
                                                             : WIFI_TRANSPORT_TCP;

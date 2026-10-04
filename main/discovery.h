@@ -25,3 +25,7 @@
 #pragma once
 
 void discovery_init();
+
+// Rename the deck on the network: its mDNS hostname (<hostname>.local) and the
+// _cpx._tcp TXT "name". Call after discovery_init().
+void discovery_set_name(const char *hostname, const char *name);

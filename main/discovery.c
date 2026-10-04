@@ -84,3 +84,14 @@ void discovery_init()
       return;
     }
 }
+
+void discovery_set_name(const char *hostname, const char *name)
+{
+    // The services follow the hostname; an interface already up re-announces.
+    if (mdns_hostname_set(hostname) != ESP_OK ||
+        mdns_service_txt_item_set("_cpx", "_tcp", "name", name) != ESP_OK) {
+      ESP_LOGW(TAG, "Could not set name %s", hostname);
+      return;
+    }
+    ESP_LOGI(TAG, "Hostname is %s, name %s", hostname, name);
+}
