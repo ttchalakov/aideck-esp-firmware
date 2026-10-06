@@ -195,8 +195,8 @@ void app_main(void)
     test_init();
 
     wifi_init();
-    // Before the router starts delivering GAP8 packets: the GAP8 renames the deck
-    // (WIFI_CTRL_SET_NAME) as soon as it can, and that needs mDNS up.
+    // Before the router starts delivering GAP8 packets: a GAP8 app can rename the
+    // deck (WIFI_CTRL_SET_NAME) as soon as it starts, and that needs mDNS up.
     discovery_init();
     router_init();
 

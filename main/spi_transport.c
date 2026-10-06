@@ -87,13 +87,10 @@ void spi_transport_debug(uint32_t *transactions, uint32_t *txPackets,
 }
 
 void IRAM_ATTR gap_rtt_enabled_handler(void * _param) {
-    // Wake spi_task with a direct task notification. The previous
-    // xEventGroupSetBitsFromISR() defers through the timer-daemon command
-    // queue and silently fails when that queue is full (which happens under
-    // sustained streaming load) - a lost edge parked spi_task in a forever
-    // wait while the GAP8 held its RTT line high, wedging the entire
-    // GAP8<->WiFi route. vTaskNotifyGiveFromISR() runs in the ISR itself and
-    // cannot be lost.
+    // Wake spi_task with a direct task notification: vTaskNotifyGiveFromISR()
+    // runs in the ISR itself and cannot be lost. xEventGroupSetBitsFromISR()
+    // defers through the timer-daemon command queue and silently fails when
+    // that queue is full, as it gets under sustained streaming load.
     BaseType_t task_woken = pdFALSE;
 
     if (spi_task_handle != NULL) {
@@ -172,10 +169,10 @@ static void spi_task(void* _param) {
         // different SPI framing -- or one corrupted transfer -- can name any 16-bit
         // size. Unchecked, the memcpy() below writes up to 64 kB into a ~1 kB static
         // packet, smashing .bss including the FreeRTOS queue structs next to it; the
-        // next xQueueSend() then panics. Hardware-observed 2026-08-30: that put the
-        // ESP in a silent reboot loop before uart_transport_init(), so CPX never came
-        // up and every bcAI:gap8 flash stalled at 0% -- and the GAP8 can only be
-        // reflashed *through* this firmware. The underflow guard matters as much:
+        // next xQueueSend() then panics. On the hardware that becomes a silent reboot
+        // loop before uart_transport_init(), so CPX never comes up and every GAP8
+        // flash (bcAI:gap8) stalls at 0% -- and the GAP8 can only be reflashed
+        // *through* this firmware. The underflow guard matters as much:
         // rx_len below CPX_ROUTING_PACKED_SIZE wraps the subtraction into a huge len.
         const bool rx_len_valid = (rx_len >= CPX_ROUTING_PACKED_SIZE) &&
                                   (rx_len <= SPI_TRANSPORT_MTU);

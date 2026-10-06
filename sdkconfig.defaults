@@ -17,8 +17,8 @@ CONFIG_FREERTOS_HZ=100
 
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=5000
 
-# Memory bounds (see external/README.md "Local TCP fix"): the NINA has ~40 KB
-# of free heap and the WiFi blob dies when lwIP/driver buffering exhausts it.
+# Memory bounds: the NINA has ~40 KB of free heap and the WiFi blob dies when
+# lwIP/driver buffering exhausts it.
 CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=10
 CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=32
 CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=8

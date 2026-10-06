@@ -1,4 +1,4 @@
-## mdns left the IDF core in v5.0 and is pulled in as a managed component.
+## ESP-IDF 5 has no mdns in its core, so it comes in as a managed component.
 dependencies:
   espressif/mdns: "^1.2.0"
   idf: ">=5.0"

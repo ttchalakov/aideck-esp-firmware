@@ -56,7 +56,8 @@ static esp_routable_packet_t txp;
 
 // An 802.11 SSID is at most 32 bytes, as in wifi_config_t; one more for the terminator.
 #define MAX_SSID_SIZE (33)
-#define MAX_PASSWD_SIZE (50)
+// A WPA2 key is an 8-63 character passphrase or 64 hex digits, plus the terminator.
+#define MAX_PASSWD_SIZE (65)
 // A DNS label is at most 63 bytes; the TXT name gets the same bound.
 #define MAX_NAME_SIZE (64)
 
@@ -77,9 +78,9 @@ static EventGroupHandle_t startUpEventGroup;
 
 
 #define NO_CONNECTION -1
-// 2 was too tight (any TCP jitter immediately backpressured the SPI/GAP8
-// route), but every slot is ~1 KB of a ~40 KB heap - and heap headroom is
-// what keeps the WiFi driver alive under load (see wifi_status_task).
+// Fewer slots let any TCP jitter back-pressure the SPI/GAP8 route, but every
+// slot is ~1 KB of a ~40 KB heap - and heap headroom is what keeps the WiFi
+// driver alive under load (see wifi_status_task).
 #define WIFI_HOST_QUEUE_LENGTH (4)
 
 // How many consecutive 1 s send timeouts before the client is declared dead
@@ -93,10 +94,10 @@ static EventGroupHandle_t startUpEventGroup;
 // unacknowledged ESP<->GAP8 SPI link and can be dropped there; a TCP client
 // (unlike a UDP one, whose periodic FER re-announce drives a re-signal) sends
 // nothing after connecting, so the ESP must retransmit the notification itself
-// or the GAP8 can gate on it forever and never emit a first frame. The GAP8
-// makes a repeat idempotent, so this doubles as a cheap keepalive once the
-// first one lands. ~1 s bounds recovery from a dropped notification to about
-// one interval while costing only two 2-byte control packets per second.
+// or a GAP8 app that waits for it can wait forever. The GAP8 side must treat a
+// repeat as idempotent; this then doubles as a cheap keepalive once the first
+// one lands. ~1 s bounds recovery from a dropped notification to about one
+// interval while costing only one 2-byte control packet per second.
 #define WIFI_CLIENT_CONNECTED_REASSERT_MS (1000)
 
 static QueueHandle_t wifiRxQueue;
@@ -133,8 +134,8 @@ enum {
 // Host link transport, chosen at runtime by the GAP8 (WIFI_CTRL_SET_TRANSPORT)
 // before it asks to connect. TCP is framed and lossless (integrity transport);
 // UDP is connectionless and drop-tolerant (a stalled host cannot back-pressure
-// the SPI/GAP8 route, at the cost of dropped datagrams). Default TCP so any app
-// that never sends SET_TRANSPORT behaves exactly as before.
+// the SPI/GAP8 route, at the cost of dropped datagrams). TCP is the default, for
+// an app that never sends SET_TRANSPORT.
 enum {
   WIFI_TRANSPORT_TCP = 0,
   WIFI_TRANSPORT_UDP = 1,
@@ -142,9 +143,9 @@ enum {
 static volatile uint8_t transportMode = WIFI_TRANSPORT_TCP;
 
 // Access point channel, chosen by the GAP8 (WIFI_CTRL_SET_CHANNEL) before it asks
-// to connect. Channel 1, the old default, was the most congested band in this lab,
-// and RF retry pressure deepens the driver TX queues and helps trip the low-heap
-// radio failure under streaming load; 6 is the default for an app that never says.
+// to connect; 6 for an app that never says. A quiet channel matters: RF retry
+// pressure deepens the driver TX queues and helps trip the low-heap radio failure
+// under streaming load.
 #define AP_DEFAULT_CHANNEL 6
 #define AP_MAX_CHANNEL 13
 static uint8_t apChannel = AP_DEFAULT_CHANNEL;
@@ -343,9 +344,9 @@ static void wifi_ctrl(void* _param) {
         }
         break;
       case WIFI_CTRL_SET_NAME: {
-        // "<hostname>\0<name>\0" from the GAP8 app's build, e.g. "cf-80-2m-e7e7e7e7e7"
-        // and "80/2M/E7E7E7E7E7": the name the host looks the deck up by. Both
-        // strings must end inside the packet.
+        // "<hostname>\0<name>\0": the deck's mDNS hostname and the _cpx._tcp TXT
+        // "name", which a host can look the deck up by. Both strings must end
+        // inside the packet.
         const size_t length = rxp.dataLength - 1;
         const char *hostname = (const char *)&rxp.data[1];
         const size_t hostnameLength = strnlen(hostname, length);
@@ -448,7 +449,7 @@ void wifi_wait_for_socket_connected() {
     ESP_LOGE(TAG, "Unable to accept connection: errno %d", errno);
   } else {
     // Bound every send and detect a vanished peer. An unbounded blocking
-    // send() on this socket is what stalled the whole GAP8->WiFi route (see
+    // send() on this socket would stall the whole GAP8->WiFi route (see
     // wifi_send_packet); keepalive catches a host that disappears without a
     // FIN, and NODELAY stops Nagle from delaying the length-prefixed stream.
     const struct timeval sendTimeout = { .tv_sec = 1, .tv_usec = 0 };
@@ -516,16 +517,16 @@ static void wifi_task(void *pvParameters) {
 
     //blink_period_ms = 100;
 
-    // Tell the GAP8 (and STM32) a client is connected so the GAP8 leaves its
-    // pre-client gate and starts streaming, then re-assert on a fixed interval
-    // until the client drops. The single accept-time packet can be lost on the
-    // unacknowledged ESP<->GAP8 SPI link, and a TCP client sends nothing after
-    // connecting (so there is no host-driven re-signal like UDP's FER); without
-    // the periodic re-assert a dropped notification wedges the GAP8 forever with
-    // no first frame. The GAP8 makes repeats idempotent - they neither restart
-    // its settle timer nor republish an event - so the re-assert is a free
-    // no-op once the first one lands. Routing through wifi_signal_client_connected()
-    // also keeps this off the shared, non-thread-safe txp packet.
+    // Tell the GAP8 (and STM32) a client is connected, then re-assert it every
+    // WIFI_CLIENT_CONNECTED_REASSERT_MS until the client drops. The single
+    // accept-time packet can be lost on the unacknowledged ESP<->GAP8 SPI link,
+    // and a TCP client sends nothing after connecting (so there is no
+    // host-driven re-signal like UDP's FER); without the periodic re-assert a
+    // dropped notification leaves a GAP8 app that waits for a client waiting
+    // forever. The GAP8 side must treat repeats as idempotent, so the re-assert
+    // is a free no-op once the first one lands. Routing through
+    // wifi_signal_client_connected() also keeps this off the shared,
+    // non-thread-safe txp packet.
     wifi_signal_client_connected(1);
     while (!wifi_wait_for_disconnect(pdMS_TO_TICKS(WIFI_CLIENT_CONNECTED_REASSERT_MS))) {
       wifi_signal_client_connected(1);
@@ -589,8 +590,7 @@ void wifi_send_packet(const char * buffer, size_t size) {
   if (transportMode == WIFI_TRANSPORT_UDP) {
     // Fail-fast, drop-on-error datagram send. Dropping (rather than blocking to
     // retry, as TCP does) is exactly what keeps a stalled host from starving the
-    // WiFi driver's heap and killing the radio - the reason UDP survives raw
-    // streaming. Never blocks the GAP8 route.
+    // WiFi driver's heap and killing the radio. Never blocks the GAP8 route.
     if (serverSock < 0 || !udpClientKnown) {
       return;
     }
@@ -616,10 +616,10 @@ void wifi_send_packet(const char * buffer, size_t size) {
   wifiSendCalls++;
   xEventGroupSetBits(s_wifi_event_group, WIFI_PACKET_SENDING);
 
-  // send() may write only part of the buffer (SO_SNDTIMEO is set); the old
-  // code ignored the byte count, silently truncating packets and desyncing
-  // the host's length-prefixed stream. Loop until fully written, and give up
-  // on a peer that stops draining for WIFI_SEND_TIMEOUT_MAX seconds.
+  // send() may write only part of the buffer (SO_SNDTIMEO is set), and
+  // ignoring the byte count truncates packets and desyncs the host's
+  // length-prefixed stream. Loop until fully written, and give up on a peer
+  // that stops draining for WIFI_SEND_TIMEOUT_MAX seconds.
   size_t written = 0;
   int timeouts = 0;
   while (written < size && clientConnection != NO_CONNECTION) {
@@ -698,7 +698,7 @@ static void wifi_receiving_task(void *pvParameters) {
       // timeout, re-announcing). Lock onto its source addr:port and repeat the
       // idempotent GAP8 notification as well. A control packet can be lost in
       // the shallow CPX queues; suppressing later notifications then leaves the
-      // ESP with a client while the GAP8 waits forever and emits no first frame.
+      // ESP with a client while the GAP8 waits for one forever.
       if (len == 3 && memcmp(&rxp_wifi, "FER", 3) == 0) {
         xSemaphoreTake(udpTargetLock, portMAX_DELAY);
         udpDestAddr = src;
@@ -717,9 +717,8 @@ static void wifi_receiving_task(void *pvParameters) {
       }
 
       // Genuine host->deck CPX packet: 2-byte length prefix + payload, one whole
-      // packet per datagram. Validate strictly against the datagram bounds - the
-      // LARICS fork trusted the wire length blindly, so a short/garbage datagram
-      // underflowed dataLength in wifi_transport_receive and memcpy'd ~64 KB.
+      // packet per datagram. Validate it strictly against the datagram bounds and
+      // drop anything malformed.
       if (len < 2) {
         continue;
       }
@@ -739,9 +738,8 @@ static void wifi_receiving_task(void *pvParameters) {
       continue;
     }
 
-    // Read the exact 2-byte length header; a short read here (or an error in
-    // the payload loop below, which the old code never checked) permanently
-    // desynced the host->deck stream.
+    // Read the exact 2-byte length header; a short read here, or an error in
+    // the payload loop below, would permanently desync the host->deck stream.
     int headerLen = 0;
     while (headerLen < 2) {
       len = recv(clientConnection, ((uint8_t*)&rxp_wifi) + headerLen, 2 - headerLen, 0);
@@ -753,8 +751,8 @@ static void wifi_receiving_task(void *pvParameters) {
     if (headerLen < 2) {
       // 0 is the client's FIN. An error is final too (a reset, or the socket the
       // TX task already closed), except a signal or a spurious wake-up: retrying
-      // on a reset connection left an idle client open forever, and with it the
-      // single-client server, since nothing on the send side notices.
+      // on a reset connection would leave an idle client open forever, and with
+      // it the single-client server, since nothing on the send side notices.
       if (len == 0 || (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK)) {
         close_client_socket();
       } else {
